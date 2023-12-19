@@ -1,0 +1,135 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Resources": {
+        "M03P02SG": {
+            "Type": "AWS::EC2::SecurityGroup",
+            "Properties": {
+            	"SecurityGroupIngress" : [{
+         			"IpProtocol" : "tcp",
+         			"FromPort" : 80,
+         			"ToPort" : 80,
+         			"CidrIp" : "0.0.0.0/0"
+      			},
+      			{
+         			"IpProtocol" : "tcp",
+         			"FromPort" : 22,
+         			"ToPort" : 22,
+         			"CidrIp" : "0.0.0.0/0"
+      			}],
+
+                "GroupDescription": "Allows HTTP and SSH",
+                "Tags" : [ {"Key" : "Name", "Value" : "M03P02SG"} ]
+            }
+        },
+        "M03P02EC2InstanceProfile" : {
+            "Type" : "AWS::IAM::InstanceProfile",
+            "Properties" : {
+                "Path" : "/",
+                "Roles" : ["EC2Role"]
+            }
+        },
+        "M03P02EC2Instance": {
+            "Type": "AWS::EC2::Instance",
+            "Properties": {
+            	"InstanceType" : "t2.micro",
+            	"ImageId" : "ami-048f6ed62451373d9",
+                "KeyName" : "M03P02keypair",
+                "IamInstanceProfile" : {"Ref" : "M03P02EC2InstanceProfile"},
+                "SecurityGroups": [{"Ref": "M03P02SG"}],
+                "Tags" : [ {"Key" : "Name", "Value" : "M03P02EC2Instance"} ]
+            }
+        },
+        "M03P02Stream": {
+            "Type": "AWS::Kinesis::Stream",
+            "Properties": {
+                "Name": "m03p02_raw_data_stream",
+                "RetentionPeriodHours" : 168,
+                "ShardCount": 3,
+                "Tags": [{
+                    "Key": "Environment",
+                    "Value": "Production"
+                }]
+            }
+        },
+        "M03P02SNSTopic": {
+            "Type": "AWS::SNS::Topic",
+            "Properties": {
+                "Subscription": [{
+                  "Endpoint": "seema.nair@outlook.com",
+                  "Protocol": "email"
+                }],
+                "TopicName": "m03p02_anomaly_alerts"
+            }
+        },
+        "M03P02DynamoDBTable" : {
+            "Type" : "AWS::DynamoDB::Table",
+            "Properties" : {
+                "AttributeDefinitions" : [{
+                    "AttributeName" : "deviceid",
+                    "AttributeType" : "S"
+                  },
+                  {
+                    "AttributeName" : "timestamp",
+                    "AttributeType" : "S"
+                  }
+                ],
+                "KeySchema" : [{
+                    "AttributeName": "deviceid",
+                    "KeyType": "HASH"
+                  },
+                  {
+                  "AttributeName": "timestamp",
+                  "KeyType": "RANGE"
+                  }
+                ],
+                "TableName" : "m03p02_anomaly_data",
+                "Tags" : [ {"Key" : "Name", "Value" : "dynamodb"} ],
+                "ProvisionedThroughput": {
+                    "ReadCapacityUnits": 5,
+                    "WriteCapacityUnits": 5
+                }
+            }
+
+        },
+        "M03P02S3Bucket": {
+            "Type": "AWS::S3::Bucket",
+            "DeletionPolicy": "Retain",
+            "Properties": {
+                "BucketName": "m03p02-snair-bucket"
+            }
+        },
+        "M03P02KinesisLambdaTriggerMapping": {
+            "Type": "AWS::Lambda::EventSourceMapping",
+            "Properties": {
+                "Batchsize": 100,
+                "Enabled": true,
+                "EventSourceArn": {"Fn::GetAtt": ["M03P02Stream","Arn"]},
+                "FunctionName": {"Fn::GetAtt": ["M03P02Lambda","Arn"]},
+                "MaximumBatchingWindowInSeconds": 0,
+                "StartingPosition": "LATEST"
+            }
+        },
+        "M03P02Lambda": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Role": "arn:aws:iam::862085834875:role/LambdaRole",
+                "Handler": "index.lambda_handler",
+                "Runtime": "python3.7",
+
+                "Code": {
+                    "ZipFile": "from pprint import pprint\nimport boto3\nimport json\nimport csv\nimport datetime\nimport os\nimport random\nimport base64\nfrom decimal import Decimal\nfrom botocore.exceptions import ClientError\n\n\ndef lambda_handler(event, context):\n    \n    AWS_REGION = 'us-east-1'\n    #print(event)\n    \n    dynamodb_res = boto3.resource('dynamodb', region_name=AWS_REGION)\n    anomaly_table = dynamodb_res.Table('m03p02_anomaly_data')\n\n    sns_client = boto3.client('sns', region_name=AWS_REGION)\n    topic_arn = \"arn:aws:sns:us-east-1:862085834875:m03p02_anomaly_alerts\"\n\n    for record in event['Records']:\n        data_point = base64.b64decode(record['kinesis']['data'])\n        data_point = str(data_point, 'utf-8')\n        # pprint(data_point, sort_dicts=False)\n        pprint(data_point)\n        data_point = json.loads(data_point)\n\n        anomaly_type = {}\n\n        if data_point[\"value\"] <= (1.1 * float(data_point['lowest_temp'])):\n            anomaly_type = \"Cold\"\n        elif data_point[\"value\"] >= (0.9 * float(data_point['highest_point'])):\n            anomaly_type = \"Hot\"\n\n        anomaly_data = {'deviceid': data_point[\"deviceid\"], \n                            'anomalyDate': data_point[\"date\"], \n                            'timestamp': data_point[\"timestamp\"], \n                            'value': data_point[\"value\"],\n                            'anomalyType': anomaly_type}\n        \n        anomaly_data = json.loads(json.dumps(anomaly_data), parse_float=Decimal)\n        response = anomaly_table.put_item(Item=anomaly_data)\n        #pprint(\"DB Response Data: \", response)\n        sns_client.publish(TopicArn=topic_arn, \n                            Message=str(\"Anomaly value = \" + str(anomaly_data['value']) + \" is detected. \" + \"Detcted temperature can be categorized as \" + anomaly_data['anomalyType']) , \n                            Subject=str(anomaly_data['anomalyType'] + \" temperature is detected.\")\n                            )\n    return 1"
+                }
+            }
+        }
+    },
+    "Outputs": {
+        "InstanceId": {
+            "Description": "The Instance Id of the newly created EC2 instance",
+            "Value": {"Ref": "M03P02EC2Instance"}
+        },
+        "MyTopicArn": {
+            "Description": "Arn of Created SNS Topic",
+            "Value": {"Ref": "M03P02SNSTopic"}
+        }
+    }
+}
